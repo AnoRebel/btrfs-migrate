@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  ci:
+    name: Gate on CI
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: ci
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: true
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          outdir="dist"
+          mkdir -p "$outdir"
+          bin="btrfs-migrate-${version}-${GOOS}-${GOARCH}"
+          go build \
+            -trimpath \
+            -ldflags="-s -w -X main.Version=${version}" \
+            -o "$outdir/${bin}" \
+            .
+          ( cd "$outdir" && sha256sum "${bin}" > "${bin}.sha256" )
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: btrfs-migrate-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          set -euo pipefail
+          prev=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || echo "")
+          {
+            echo "## Changes"
+            echo ""
+            if [ -n "$prev" ]; then
+              echo "Since [\`$prev\`](https://github.com/${GITHUB_REPOSITORY}/releases/tag/${prev}):"
+              echo ""
+              git log --pretty=format:'- %s (%h)' "${prev}..${GITHUB_REF_NAME}"
+            else
+              git log --pretty=format:'- %s (%h)' "${GITHUB_REF_NAME}"
+            fi
+            echo ""
+            echo ""
+            echo "## Artifacts"
+            echo ""
+            echo "Each binary embeds the bash scripts. Verify with \`sha256sum -c *.sha256\`."
+          } > CHANGELOG.md
+          {
+            echo 'body<<__EOF__'
+            cat CHANGELOG.md
+            echo '__EOF__'
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: ${{ steps.changelog.outputs.body }}
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/*
+          fail_on_unmatched_files: true

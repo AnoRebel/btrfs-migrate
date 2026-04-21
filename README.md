@@ -48,7 +48,7 @@ possible:
 | `cryptsetup`      | yes                 | yes           | —                                                                      |
 | `lvm2`            | yes                 | yes           | —                                                                      |
 | `snapper`         | yes (universe)      | yes           | —                                                                      |
-| `btrfs-assistant` | no                  | AUR           | Skipped with a warning; install manually.                              |
+| `btrfs-assistant` | yes (universe)      | yes (extra)   | Clone <https://gitlab.com/btrfs-assistant/btrfs-assistant>, CMake build. |
 | `timeshift`       | yes                 | yes           | —                                                                      |
 | `grub-btrfs`      | no                  | yes (extra)   | Clone <https://github.com/Antynea/grub-btrfs>, `make install` as root. |
 

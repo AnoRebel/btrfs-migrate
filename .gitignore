@@ -1,0 +1,18 @@
+# Go build artifacts
+/bin/
+/btrfs-migrate
+*.test
+*.out
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Runtime artifacts
+/var-log-btrfs-migrate.log
+/tmp-*.log
+
+# Local override (intentional, user-scoped)
+.env.local

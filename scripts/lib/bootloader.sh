@@ -29,18 +29,30 @@ bootloader_validate() {
 # bind_target_mounts ROOT_MP EFI_MP — bind /proc /sys /dev /dev/pts /run
 # into the target and, when EFI_MP is non-empty, also efivarfs so
 # grub-install / bootctl can write NVRAM entries. Registers rollbacks.
+# Idempotent: if a directory is already a mountpoint (detected via
+# findmnt), we skip re-binding and do not register a rollback for it —
+# the caller that established the mount owns its cleanup.
 bind_target_mounts() {
     local root_mp="$1" efi_mp="${2:-}"
     local d
     for d in proc sys dev dev/pts run; do
         run mkdir -p "$root_mp/$d"
+        if findmnt -nr --target "$root_mp/$d" -o TARGET 2>/dev/null | grep -qx "$root_mp/$d"; then
+            debug "bind_target_mounts: $root_mp/$d already mounted — skipping"
+            continue
+        fi
         run mount --bind "/$d" "$root_mp/$d"
-        on_rollback "umount '$root_mp/$d' 2>/dev/null || true"
+        on_rollback -- umount "$root_mp/$d"
     done
     if [[ -n "$efi_mp" ]] && [[ -d /sys/firmware/efi/efivars ]]; then
         run mkdir -p "$root_mp/sys/firmware/efi/efivars"
-        run mount --bind /sys/firmware/efi/efivars "$root_mp/sys/firmware/efi/efivars"
-        on_rollback "umount '$root_mp/sys/firmware/efi/efivars' 2>/dev/null || true"
+        if findmnt -nr --target "$root_mp/sys/firmware/efi/efivars" -o TARGET 2>/dev/null \
+                | grep -qx "$root_mp/sys/firmware/efi/efivars"; then
+            debug "bind_target_mounts: efivars already mounted — skipping"
+        else
+            run mount --bind /sys/firmware/efi/efivars "$root_mp/sys/firmware/efi/efivars"
+            on_rollback -- umount "$root_mp/sys/firmware/efi/efivars"
+        fi
     fi
 }
 
@@ -56,7 +68,10 @@ grub_tune_defaults() {
     local file="$root_mp/etc/default/grub"
     [[ -f "$file" ]] || {
         log "Creating $file"
-        run bash -c "printf '%s\n' 'GRUB_TIMEOUT=5' 'GRUB_CMDLINE_LINUX_DEFAULT=\"quiet\"' 'GRUB_CMDLINE_LINUX=\"\"' > \"$file\""
+        write_file "$file" 'GRUB_TIMEOUT=5
+GRUB_CMDLINE_LINUX_DEFAULT="quiet"
+GRUB_CMDLINE_LINUX=""
+'
     }
 
     # Append cmd_extra to GRUB_CMDLINE_LINUX without duplication.
@@ -90,7 +105,8 @@ grub_tune_defaults() {
         if grep -q '^GRUB_PRELOAD_MODULES=' "$file"; then
             run sed -i -E "s|^GRUB_PRELOAD_MODULES=.*|GRUB_PRELOAD_MODULES=\"$cur_preload\"|" "$file"
         else
-            run bash -c "printf 'GRUB_PRELOAD_MODULES=\"%s\"\n' \"$cur_preload\" >> \"$file\""
+            append_file "$file" "GRUB_PRELOAD_MODULES=\"$cur_preload\"
+"
         fi
     fi
 }
@@ -101,7 +117,8 @@ _grub_kv_set() {
     if grep -Eq "^${key}=" "$file"; then
         run sed -i -E "s|^${key}=.*|${key}=${val}|" "$file"
     else
-        run bash -c "printf '%s=%s\n' \"$key\" \"$val\" >> \"$file\""
+        append_file "$file" "$key=$val
+"
     fi
 }
 
@@ -182,21 +199,25 @@ sdboot_install() {
     # refine.
     local loader_dir="$root_mp/boot/efi/loader"
     run mkdir -p "$loader_dir/entries"
-    run bash -c "printf 'default  btrfs-migrate.conf\ntimeout  5\nconsole-mode max\n' > \"$loader_dir/loader.conf\""
+    write_file "$loader_dir/loader.conf" 'default  btrfs-migrate.conf
+timeout  5
+console-mode max
+'
 
     local entry="$loader_dir/entries/btrfs-migrate.conf"
-    local linux initrd
+    local linux initrd arch
+    arch=$(uname -m)
     case "$DISTRO_LIKE" in
         debian) linux="/vmlinuz" ; initrd="/initrd.img" ;;   # Ubuntu maintains symlinks in /
         arch)   linux="/vmlinuz-linux" ; initrd="/initramfs-linux.img" ;;
+        *)      die "sdboot_install: unknown DISTRO_LIKE '$DISTRO_LIKE'" 10 ;;
     esac
 
-    run bash -c "cat > \"$entry\" <<EOF
-title   btrfs-migrate (\$(uname -m))
+    write_file "$entry" "title   btrfs-migrate ($arch)
 linux   $linux
 initrd  $initrd
 options $cmdline rw
-EOF"
+"
 }
 
 # -- Top-level dispatch ------------------------------------------------------

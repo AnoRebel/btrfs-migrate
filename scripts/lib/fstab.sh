@@ -52,11 +52,24 @@ fstab_write_managed_block() {
     local fstab="$root_mp/etc/fstab"
     [[ -f "$fstab" ]] || die "No fstab at $fstab" 30
 
+    # Refuse to touch fstab that has unbalanced or duplicate markers —
+    # someone else's editor/merge tool may have corrupted it, and our awk
+    # block-copy below would silently drop or duplicate content.
+    local n_begin n_end
+    n_begin=$(grep -cF "$FSTAB_TAG_BEGIN" "$fstab" || true)
+    n_end=$(grep -cF "$FSTAB_TAG_END"   "$fstab" || true)
+    if (( n_begin != n_end )); then
+        die "fstab $fstab has $n_begin BEGIN and $n_end END markers — refusing to rewrite. Fix manually." 30
+    fi
+    if (( n_begin > 1 )); then
+        die "fstab $fstab has $n_begin managed blocks — refusing to rewrite. Collapse to one manually." 30
+    fi
+
     local tmp; tmp=$(mktemp)
-    on_rollback "rm -f '$tmp' 2>/dev/null || true"
+    on_rollback -- rm -f "$tmp"
 
     # Copy everything OUTSIDE our markers to tmp (if markers exist at all).
-    if grep -qF "$FSTAB_TAG_BEGIN" "$fstab"; then
+    if (( n_begin == 1 )); then
         awk -v b="$FSTAB_TAG_BEGIN" -v e="$FSTAB_TAG_END" '
             index($0,b)==1 { inblock=1; next }
             index($0,e)==1 { inblock=0; next }
@@ -66,8 +79,17 @@ fstab_write_managed_block() {
         cp -a "$fstab" "$tmp"
     fi
 
-    # Ensure a trailing newline before appending, then append our block.
-    [[ -s "$tmp" ]] && tail -c1 "$tmp" | read -r _ || printf '\n' >> "$tmp"
+    # Ensure a trailing newline before appending our block.
+    # `tail -c1 | read -r` is broken: when the last byte IS a newline,
+    # `read` sees EOF on an empty trimmed line and returns 1, which then
+    # triggers the `||` branch and appends a *spurious* blank line every
+    # run (breaking idempotency). Compare the last byte directly instead.
+    if [[ -s "$tmp" ]]; then
+        local last_byte
+        last_byte=$(tail -c1 -- "$tmp"; printf x)  # trailing x protects against cmd-sub trim
+        last_byte=${last_byte%x}
+        [[ "$last_byte" == $'\n' ]] || printf '\n' >> "$tmp"
+    fi
     {
         printf '\n%s\n' "$FSTAB_TAG_BEGIN"
         printf '%s\n' "$@"
@@ -78,7 +100,7 @@ fstab_write_managed_block() {
     local bak="$fstab.bak.$(date -u +%Y%m%dT%H%M%SZ)"
     log "Backing up $fstab to $bak"
     run cp -a -- "$fstab" "$bak"
-    on_rollback "cp -a '$bak' '$fstab' 2>/dev/null || true"
+    on_rollback -- cp -a -- "$bak" "$fstab"
     log "Writing updated $fstab"
     run install -m 0644 -T -- "$tmp" "$fstab"
     rm -f -- "$tmp"

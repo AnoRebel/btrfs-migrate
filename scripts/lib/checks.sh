@@ -126,6 +126,9 @@ pkg_available() {
 require_partition() {
     local dev="$1"
     [[ -n "$dev" ]] || die "Partition path is empty." 10
+    # Reject device paths with shell/regex metachars — they'd be safe as
+    # argv but surface in log messages and error text downstream.
+    [[ "$dev" =~ ^/dev/[A-Za-z0-9/_-]+$ ]] || die "Invalid device path: $dev" 10
     [[ -b "$dev" ]] || die "Not a block device: $dev" 10
     local type; type=$(lsblk -ndo TYPE "$dev" 2>/dev/null || true)
     case "$type" in
@@ -133,6 +136,77 @@ require_partition() {
         disk) die "Refusing to treat whole disk '$dev' as a partition. Create partitions first." 10 ;;
         *)    die "Unexpected block device type '$type' for $dev." 10 ;;
     esac
+}
+
+# require_whole_disk DEV — must be a block device of TYPE=disk (for BIOS
+# grub-install targets). Refuses partitions.
+require_whole_disk() {
+    local dev="$1"
+    [[ -n "$dev" ]] || die "Disk path is empty." 10
+    [[ "$dev" =~ ^/dev/[A-Za-z0-9/_-]+$ ]] || die "Invalid disk path: $dev" 10
+    [[ -b "$dev" ]] || die "Not a block device: $dev" 10
+    local type; type=$(lsblk -ndo TYPE "$dev" 2>/dev/null || true)
+    [[ "$type" == "disk" ]] || die "Expected whole disk for '$dev' but got type='$type'." 10
+}
+
+# require_distinct_devices DEV1 DEV2 ... — die if any pair refers to the
+# same underlying block device (by resolving symlinks / same major:minor).
+require_distinct_devices() {
+    declare -A seen=()
+    local d resolved key
+    for d in "$@"; do
+        [[ -z "$d" ]] && continue
+        resolved=$(readlink -f -- "$d" 2>/dev/null || printf '%s' "$d")
+        key=$(lsblk -ndo MAJ:MIN -- "$resolved" 2>/dev/null || printf '%s' "$resolved")
+        if [[ -n "${seen[$key]:-}" ]]; then
+            die "Device collision: '$d' and '${seen[$key]}' resolve to the same block device ($key)." 10
+        fi
+        seen[$key]="$d"
+    done
+}
+
+# require_keyfile_ownership FILE — keyfile must be owned by uid 0 and
+# have no group/world bits set. Prevents exfiltration via a weaker-ACL
+# file passed in by accident.
+require_keyfile_ownership() {
+    local f="$1"
+    [[ -f "$f" ]] || die "Keyfile not found: $f" 10
+    local uid; uid=$(stat -c '%u' -- "$f" 2>/dev/null || echo '')
+    [[ "$uid" == "0" ]] || die "Keyfile '$f' must be owned by root (uid=0), got uid=$uid." 10
+    local mode; mode=$(stat -c '%a' -- "$f" 2>/dev/null || echo '')
+    case "$mode" in
+        600|400) : ;;
+        *) die "Keyfile '$f' must be chmod 0600 or 0400 (got 0$mode)." 10 ;;
+    esac
+}
+
+# require_username NAME — Linux username rules (IEEE Std 1003.1 + Debian):
+# 1-32 chars, [a-z_][a-z0-9_-]*. Rejects trailing '$' (Samba machine acct).
+require_username() {
+    local name="$1"
+    [[ "$name" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] \
+        || die "Invalid username '$name' (must match [a-z_][a-z0-9_-]{0,31})." 10
+}
+
+# require_subvol_name NAME — @ or @[A-Za-z0-9_.-]{1,62}. No spaces, no
+# slashes, no shell metas — these become path components.
+require_subvol_name() {
+    local name="$1"
+    [[ "$name" =~ ^@[A-Za-z0-9_.-]{0,62}$ ]] \
+        || die "Invalid subvolume name '$name' (must match @[A-Za-z0-9_.-]{0,62})." 10
+}
+
+# require_srcmp_looks_like_root DIR — sanity: the path the user passed as
+# --src-mp should actually look like a rootfs (/etc/fstab + /bin or /usr).
+# Catches typos like --src-mp /home/user that would otherwise rsync half
+# a home directory into the new @.
+require_srcmp_looks_like_root() {
+    local mp="$1"
+    [[ -d "$mp" ]] || die "--src-mp '$mp' is not a directory." 10
+    [[ -f "$mp/etc/fstab" ]] \
+        || die "--src-mp '$mp' doesn't look like a rootfs (no etc/fstab)." 10
+    [[ -d "$mp/usr" || -d "$mp/bin" ]] \
+        || die "--src-mp '$mp' doesn't look like a rootfs (no usr/ or bin/)." 10
 }
 
 # fs_of DEV — echo the filesystem type, or empty string.

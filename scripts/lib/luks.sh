@@ -73,14 +73,14 @@ luks_format() {
     if [[ -n "$keyfile" ]]; then
         [[ -r "$keyfile" ]] || die "Keyfile not readable: $keyfile" 10
         run cryptsetup luksFormat "${args[@]}" --key-file "$keyfile" -- "$dev"
-        on_rollback "cryptsetup close '$CRYPT_NAME' 2>/dev/null || true"
+        on_rollback -- cryptsetup close "$CRYPT_NAME"
         run cryptsetup open --type luks --key-file "$keyfile" -- "$dev" "$CRYPT_NAME"
     else
         # Interactive: cryptsetup will prompt on the TTY. The ERR trap
         # will fire if the user aborts; that's OK (the partition's still
         # empty because we refused non-empty above).
         run cryptsetup luksFormat "${args[@]}" -- "$dev"
-        on_rollback "cryptsetup close '$CRYPT_NAME' 2>/dev/null || true"
+        on_rollback -- cryptsetup close "$CRYPT_NAME"
         run cryptsetup open --type luks -- "$dev" "$CRYPT_NAME"
     fi
     [[ -b "/dev/mapper/$CRYPT_NAME" ]] || die "LUKS open did not produce /dev/mapper/$CRYPT_NAME" 30
@@ -94,14 +94,18 @@ luks_provision_lvm() {
     local mapper="/dev/mapper/$CRYPT_NAME"
     [[ -b "$mapper" ]] || die "Expected $mapper to be open before LVM provisioning." 30
     log "Creating LVM on $mapper (VG=$LVM_VG LV=$LVM_LV_ROOT)"
+    # Tame-identifier enforcement — these values reach rollback argv and
+    # appear in paths and LVM names.
+    [[ "$LVM_VG"      =~ ^[A-Za-z0-9_.-]{1,64}$ ]] || die "Invalid LVM VG name: $LVM_VG"      10
+    [[ "$LVM_LV_ROOT" =~ ^[A-Za-z0-9_.-]{1,64}$ ]] || die "Invalid LVM LV name: $LVM_LV_ROOT" 10
     run pvcreate -ff -y "$mapper"
-    on_rollback "pvremove -ff -y '$mapper' 2>/dev/null || true"
+    on_rollback -- pvremove -ff -y "$mapper"
     run vgcreate "$LVM_VG" "$mapper"
-    on_rollback "vgremove -ff -y '$LVM_VG' 2>/dev/null || true"
+    on_rollback -- vgremove -ff -y "$LVM_VG"
     # Use all free extents for the root LV. Users who want /home on its own
     # LV can run lvcreate themselves after the migration.
     run lvcreate -l 100%FREE -n "$LVM_LV_ROOT" "$LVM_VG"
-    on_rollback "lvremove -ff -y '$LVM_VG/$LVM_LV_ROOT' 2>/dev/null || true"
+    on_rollback -- lvremove -ff -y "$LVM_VG/$LVM_LV_ROOT"
     [[ -b "/dev/$LVM_VG/$LVM_LV_ROOT" ]] || die "Expected /dev/$LVM_VG/$LVM_LV_ROOT after lvcreate." 30
 }
 
@@ -126,17 +130,24 @@ luks_write_crypttab() {
     local uuid_eq; uuid_eq=$(uuid_of "$dev")
     local tab="$root_mp/etc/crypttab"
     local line="$name $uuid_eq none luks,discard"
+    # CRYPT_NAME and LVM_VG/LV names are used as regex literals below and
+    # as column-1 keys; reject anything that isn't a tame identifier so a
+    # hostile env override can't smuggle in shell or regex metachars.
+    [[ "$name" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || die "Invalid crypt mapper name: $name" 10
     if [[ ! -f "$tab" ]]; then
         log "Creating $tab"
-        run bash -c "printf '# <name> <device> <password> <options>\n%s\n' \"$line\" > \"$tab\""
+        write_file "$tab" "# <name> <device> <password> <options>
+$line
+"
     else
         # Idempotent replace-or-append keyed on first column (name).
-        if grep -Eq "^\s*${name}\s" "$tab"; then
+        if grep -Eq "^[[:space:]]*${name}[[:space:]]" "$tab"; then
             log "Updating existing $tab entry for $name"
-            run sed -i -E "s|^\s*${name}\s.*|${line}|" "$tab"
+            run sed -i -E "s|^[[:space:]]*${name}[[:space:]].*|${line}|" "$tab"
         else
             log "Appending $tab entry for $name"
-            run bash -c "printf '%s\n' \"$line\" >> \"$tab\""
+            append_file "$tab" "$line
+"
         fi
     fi
     run chmod 0600 "$tab"
@@ -183,7 +194,8 @@ luks_configure_initramfs() {
                 if grep -q '^#\?CRYPTSETUP=' "$hook"; then
                     run sed -i -E 's|^#?CRYPTSETUP=.*|CRYPTSETUP=y|' "$hook"
                 else
-                    run bash -c "printf 'CRYPTSETUP=y\n' >> \"$hook\""
+                    append_file "$hook" "CRYPTSETUP=y
+"
                 fi
             fi
             run chroot "$root_mp" update-initramfs -u -k all

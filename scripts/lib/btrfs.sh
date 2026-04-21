@@ -52,14 +52,37 @@ btrfs_validate_subvols() {
     (( has_home == 1 )) || die "Subvolume set must include '@home'." 10
 }
 
-# btrfs_mkfs DEV — mkfs.btrfs on the selected root block device.
-# Caller is responsible for having checked/cleared the device.
+# btrfs_mkfs DEV [LABEL] — mkfs.btrfs on the selected root block device.
+# Refuses to overwrite an existing filesystem unless BTRFS_MKFS_FORCE=1
+# is set explicitly in the environment. This protects against rerunning
+# the script after a partial success (where the partition is already a
+# populated btrfs) silently wiping the prior migration.
+#
+# Existing-btrfs handling:
+#   - If DEV is already btrfs AND BTRFS_MKFS_FORCE is unset -> die.
+#   - If DEV is already btrfs AND BTRFS_MKFS_FORCE=1 -> wipefs + mkfs.
+#   - If DEV has any other signature -> die (upstream policy: empty only).
 btrfs_mkfs() {
     local dev="$1" label="${2:-}"
     ensure_bins mkfs.btrfs
+    [[ -b "$dev" ]] || die "btrfs_mkfs: not a block device: $dev" 30
+
+    local existing_fs=""
+    existing_fs=$(lsblk -no FSTYPE -- "$dev" 2>/dev/null | head -n1 || true)
+    if [[ -n "$existing_fs" ]]; then
+        if [[ "$existing_fs" == "btrfs" ]] && [[ "${BTRFS_MKFS_FORCE:-0}" != "1" ]]; then
+            die "Refusing mkfs.btrfs on $dev: already btrfs. Re-running would destroy the previous migration. Set BTRFS_MKFS_FORCE=1 to override." 30
+        fi
+        if [[ "$existing_fs" != "btrfs" ]]; then
+            die "Refusing mkfs.btrfs on $dev: existing '$existing_fs' signature. Wipe it first." 10
+        fi
+        warn "BTRFS_MKFS_FORCE=1 — overwriting existing btrfs on $dev."
+        run wipefs -a -- "$dev"
+    fi
+
     local args=(-f)
     [[ -n "$label" ]] && args+=(-L "$label")
-    log "mkfs.btrfs on $dev"
+    log "mkfs.btrfs on $dev${label:+ (label=$label)}"
     run mkfs.btrfs "${args[@]}" -- "$dev"
 }
 
@@ -69,7 +92,7 @@ btrfs_mount_top() {
     run mkdir -p "$mp"
     log "Mounting top-level subvol of $dev at $mp"
     run mount -o subvolid=5 -- "$dev" "$mp"
-    on_rollback "umount '$mp' 2>/dev/null || true"
+    on_rollback -- umount "$mp"
 }
 
 # btrfs_create_subvols MP SUBVOL1 SUBVOL2... — create subvolumes at the

@@ -17,12 +17,12 @@ import (
 	"runtime"
 	"strings"
 
-	tea "charm.land/bubbletea/v2"
 	"charm.land/bubbles/v2/help"
 	"charm.land/bubbles/v2/key"
 	"charm.land/bubbles/v2/list"
 	"charm.land/bubbles/v2/progress"
 	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 )
 
@@ -63,22 +63,22 @@ func newPalette(isDark bool) palette {
 // styles holds every lipgloss.Style the wizard draws with. Rebuilt
 // whenever the palette changes (background detection, resize, etc).
 type styles struct {
-	title        lipgloss.Style
-	header       lipgloss.Style
-	muted        lipgloss.Style
-	field        lipgloss.Style
-	warn         lipgloss.Style
-	danger       lipgloss.Style
-	success      lipgloss.Style
-	panel        lipgloss.Style
-	keyKey       lipgloss.Style
-	keyVal       lipgloss.Style
-	helpBar      lipgloss.Style
-	listTitle    lipgloss.Style
-	cursor       lipgloss.Style
-	prompt       lipgloss.Style
-	textFocused  lipgloss.Style
-	placeholder  lipgloss.Style
+	title       lipgloss.Style
+	header      lipgloss.Style
+	muted       lipgloss.Style
+	field       lipgloss.Style
+	warn        lipgloss.Style
+	danger      lipgloss.Style
+	success     lipgloss.Style
+	panel       lipgloss.Style
+	keyKey      lipgloss.Style
+	keyVal      lipgloss.Style
+	helpBar     lipgloss.Style
+	listTitle   lipgloss.Style
+	cursor      lipgloss.Style
+	prompt      lipgloss.Style
+	textFocused lipgloss.Style
+	placeholder lipgloss.Style
 }
 
 func newStyles(p palette) styles {

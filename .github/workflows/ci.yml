@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_call:
 
 permissions:
   contents: read
@@ -52,10 +53,13 @@ jobs:
       - name: shellcheck
         uses: ludeeus/action-shellcheck@2.0.0
         env:
-          SHELLCHECK_OPTS: -x -e SC1091
+          # SC1091: can't follow non-constant source (the lib files are sourced at runtime)
+          # SC2034: unused vars (false positives — vars are consumed by sourcing scripts)
+          # SC2155: declare-and-assign (preferred for readability in this codebase)
+          SHELLCHECK_OPTS: -x -e SC1091,SC2034,SC2155
         with:
           scandir: ./scripts
-          severity: warning
+          severity: error
 
       - name: bash -n syntax check
         run: |

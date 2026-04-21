@@ -111,10 +111,40 @@ every run.
 
 ## CLI wrapper
 
-A Bubble Tea wizard (`cmd/btrfs-migrate`) is in progress. It collects
-inputs interactively and invokes the bash executor with the chosen
-flags. The wizard is a convenience layer — the bash script is the
-canonical implementation.
+A Bubble Tea v2 wizard (`btrfs-migrate`, the Go binary — same name as
+the bash script, which keeps its `.sh` suffix) collects inputs
+interactively and invokes the bash executor with the chosen flags. The
+wizard is a convenience layer — the bash script is the canonical
+implementation.
+
+Build:
+
+```bash
+go build .          # produces ./btrfs-migrate
+```
+
+Standalone distribution: the bash script and every library under
+`scripts/lib/` are embedded into the Go binary via `//go:embed`. A
+single binary copied to another machine will self-extract to a
+tempdir and run. Inspect what's embedded with:
+
+```bash
+./btrfs-migrate --extract /tmp/scripts   # writes scripts/ tree there
+./btrfs-migrate --print-script-path      # resolves the path it would use
+```
+
+Unattended mode: pass all flags through via `--non-interactive` (alias
+for the wizard's straight-through mode), and combine with the bash
+script's `--yes --i-have-backups`. For encryption, provide
+`--luks-key-file FILE` (chmod 0600) so cryptsetup doesn't prompt.
+
+```bash
+sudo ./btrfs-migrate --non-interactive \
+  --root /dev/sda3 --boot /dev/sda2 --efi /dev/sda1 --user alice \
+  --encrypt luks --luks-key-file /root/luks.key \
+  --bootloader grub --install-bootloader --snapper --grub-btrfs \
+  --yes --i-have-backups
+```
 
 ## License
 

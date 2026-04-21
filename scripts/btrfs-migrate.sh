@@ -56,6 +56,7 @@ I_HAVE_BACKUPS=0
 ASSUME_YES=0
 SRC_MP=""                   # explicit source root mountpoint (optional)
 BIOS_DISK=""                # whole-disk for BIOS grub-install (e.g. /dev/sda)
+LUKS_KEYFILE=""             # optional; enables fully-unattended LUKS format
 
 show_help() {
     cat <<EOF
@@ -104,6 +105,12 @@ MOUNT OPTIONS:
   --mount-opts MODE     safe (defaults,noatime,compress=zstd) |
                         perf (defaults,noatime,compress=zstd:3 +ssd if SSD)
 
+ENCRYPTION (unattended):
+  --luks-key-file FILE  Read the LUKS passphrase from FILE instead of
+                        prompting. Must be chmod 0600 and owned by the
+                        invoking root user. Enables fully non-interactive
+                        runs when combined with --yes --i-have-backups.
+
 SAFETY:
   --dry-run             Print the plan, don't touch anything.
   --force-installed     Allow running on an installed system (not recommended).
@@ -130,6 +137,7 @@ parse_args() {
             --subvols)           SUBVOLS_CSV="$2"; shift 2 ;;
             --encrypt)           ENCRYPT_MODE="$2"; shift 2 ;;
             --encrypt-boot)      ENCRYPT_BOOT=1; shift ;;
+            --luks-key-file)     LUKS_KEYFILE="$2"; shift 2 ;;
             --bootloader)        BOOTLOADER="$2"; shift 2 ;;
             --install-bootloader)INSTALL_BOOTLOADER=1; shift ;;
             --snapper)           WANT_SNAPPER=1; shift ;;
@@ -160,10 +168,38 @@ validate_args() {
     require_partition "$BOOT_DEV"
     [[ -n "$EFI_DEV" ]] && require_partition "$EFI_DEV"
     [[ -n "$SEP_HOME_DEV" ]] && require_partition "$SEP_HOME_DEV"
+    [[ -n "$BIOS_DISK" ]] && require_whole_disk "$BIOS_DISK"
+
+    # /boot should be ext4 (or ext2/ext3) — GRUB needs a non-btrfs /boot
+    # unless --encrypt-boot with cryptodisk module is used. Reject oddball
+    # filesystems before we wire a kernel at boot we can't read.
+    if [[ -n "$BOOT_DEV" ]]; then
+        local bootfs; bootfs=$(fs_of "$BOOT_DEV")
+        case "$bootfs" in
+            ext4|ext3|ext2|'') : ;;
+            btrfs) warn "--boot $BOOT_DEV is btrfs; make sure your bootloader can read it." ;;
+            *) die "--boot $BOOT_DEV has unsupported filesystem '$bootfs' (expected ext4)." 10 ;;
+        esac
+    fi
+    if [[ -n "$EFI_DEV" ]]; then
+        local efifs; efifs=$(fs_of "$EFI_DEV")
+        case "$efifs" in
+            vfat|'') : ;;
+            *) die "--efi $EFI_DEV has filesystem '$efifs' — UEFI requires vfat/FAT32." 10 ;;
+        esac
+    fi
+
+    # Refuse overlapping device args (same disk, typo, etc.).
+    require_distinct_devices "$ROOT_DEV" "$BOOT_DEV" "$EFI_DEV" "$SEP_HOME_DEV"
 
     case "$ENCRYPT_MODE" in none|luks|lvm-luks) : ;; *) die "--encrypt must be one of: none|luks|lvm-luks" 10 ;; esac
     case "$BOOTLOADER"   in grub|systemd-boot) : ;; *) die "--bootloader must be one of: grub|systemd-boot" 10 ;; esac
     case "$MOUNT_OPTS_MODE" in safe|perf) : ;; *) die "--mount-opts must be one of: safe|perf" 10 ;; esac
+
+    # BIOS + GRUB + no EFI requires a whole-disk target.
+    if [[ "$BOOTLOADER" == "grub" ]] && [[ -z "$EFI_DEV" ]] && (( INSTALL_BOOTLOADER == 1 )); then
+        [[ -n "$BIOS_DISK" ]] || die "BIOS GRUB install requires --bios-disk /dev/sdX." 10
+    fi
 
     # systemd-boot + encrypted /boot is impossible; checked also in lib but
     # we want to reject at arg-parse time so the plan print is honest.
@@ -177,6 +213,7 @@ validate_args() {
         [[ -n "$USERNAME" ]] || die "Could not auto-detect a user. Pass --user explicitly." 10
         log "Using auto-detected --user=$USERNAME"
     fi
+    require_username "$USERNAME"
     require_user "$USERNAME"
 
     # Resolve subvolume list.
@@ -185,12 +222,27 @@ validate_args() {
     else
         SUBVOLS=("${BTRFS_DEFAULT_SUBVOLS[@]}")
     fi
+    local s
+    for s in "${SUBVOLS[@]}"; do require_subvol_name "$s"; done
     btrfs_validate_subvols "${SUBVOLS[@]}"
     (( WANT_TIMESHIFT == 1 )) && snap_warn_layout_for_timeshift "${SUBVOLS[@]}"
 
     # Encryption + data-present is a hard refusal.
     if [[ "$ENCRYPT_MODE" != "none" ]]; then
         luks_require_empty "$ROOT_DEV"
+    fi
+
+    # Keyfile (if given): must exist, be owned by root, and be 0600/0400.
+    if [[ -n "$LUKS_KEYFILE" ]]; then
+        [[ "$ENCRYPT_MODE" != "none" ]] || die "--luks-key-file requires --encrypt luks|lvm-luks." 10
+        require_keyfile_ownership "$LUKS_KEYFILE"
+        [[ -r "$LUKS_KEYFILE" ]] || die "--luks-key-file '$LUKS_KEYFILE' is not readable." 10
+    fi
+
+    # Fully-unattended runs with encryption need a keyfile; otherwise cryptsetup
+    # will prompt interactively and hang.
+    if (( ASSUME_YES == 1 )) && [[ "$ENCRYPT_MODE" != "none" ]] && [[ -z "$LUKS_KEYFILE" ]]; then
+        warn "--yes with encryption but no --luks-key-file: cryptsetup will still prompt for a passphrase on the TTY."
     fi
 }
 
@@ -254,7 +306,7 @@ SRC_AUTO_MP=""   # where we auto-mount the source rootfs if the user didn't
 
 auto_pick_src_mp() {
     if [[ -n "$SRC_MP" ]]; then
-        [[ -d "$SRC_MP" ]] || die "--src-mp '$SRC_MP' does not exist." 10
+        require_srcmp_looks_like_root "$SRC_MP"
         return 0
     fi
     if [[ "$EXEC_MODE" == "installed" ]]; then
@@ -268,6 +320,7 @@ auto_pick_src_mp() {
     if mountpoint -q /target 2>/dev/null; then
         SRC_MP="/target"
         log "Using /target as source (Ubiquity layout)."
+        require_srcmp_looks_like_root "$SRC_MP"
         return 0
     fi
     die "No source rootfs found. Mount the freshly-installed system somewhere and pass --src-mp /that/path." 10
@@ -285,7 +338,7 @@ phase_preflight() {
 phase_encrypt() {
     [[ "$ENCRYPT_MODE" == "none" ]] && return 0
     luks_tools_installed "$ENCRYPT_MODE"
-    luks_format "$ROOT_DEV"
+    luks_format "$ROOT_DEV" "$LUKS_KEYFILE"
     if [[ "$ENCRYPT_MODE" == "lvm-luks" ]]; then
         luks_provision_lvm
     fi
@@ -334,31 +387,34 @@ phase_bootloader_and_initramfs() {
     [[ "$ENCRYPT_MODE" != "none" ]] && target_block=$(luks_root_block "$ENCRYPT_MODE")
     local at_root="$TARGET_MP/@"
 
-    # Mount /boot (and /boot/efi) inside the target root so grub sees them.
+    # Mount /boot (and /boot/efi) inside the target root so grub/initramfs
+    # tooling sees them.
     run mkdir -p "$at_root/boot"
     run mount -- "$BOOT_DEV" "$at_root/boot"
-    on_rollback "umount '$at_root/boot' 2>/dev/null || true"
+    on_rollback -- umount "$at_root/boot"
     if [[ -n "$EFI_DEV" ]]; then
         run mkdir -p "$at_root/boot/efi"
         run mount -- "$EFI_DEV" "$at_root/boot/efi"
-        on_rollback "umount '$at_root/boot/efi' 2>/dev/null || true"
+        on_rollback -- umount "$at_root/boot/efi"
     fi
 
-    # LUKS wiring BEFORE initramfs rebuild.
-    if [[ "$ENCRYPT_MODE" != "none" ]]; then
-        luks_write_crypttab "$at_root" "$ROOT_DEV" "$CRYPT_NAME"
-        # luks_configure_initramfs needs proc/sys/dev already bound, and
-        # bootloader_apply will bind them. Do initramfs AFTER bind.
-    fi
+    # Bind /proc /sys /dev (and efivars if UEFI) into the target BEFORE
+    # any chroot work. Both the initramfs rebuild and grub-install need
+    # them. bootloader_apply also calls bind_target_mounts — that call is
+    # idempotent via mount namespaces, but to keep the rollback stack
+    # clean we bind once here and let bootloader_apply skip rebinding.
+    bind_target_mounts "$at_root" "${EFI_DEV:+$at_root/boot/efi}"
+    export BTRFS_MIGRATE_BIND_DONE=1
 
     local cmdline=""
     if [[ "$ENCRYPT_MODE" != "none" ]]; then
+        luks_write_crypttab "$at_root" "$ROOT_DEV" "$CRYPT_NAME"
         cmdline=$(luks_kernel_cmdline "$ROOT_DEV" "$ENCRYPT_MODE")
     fi
 
-    bootloader_apply "$at_root" "${EFI_DEV:+$at_root/boot/efi}" "$BIOS_DISK" \
-        "$BOOTLOADER" "$INSTALL_BOOTLOADER" "$ENCRYPT_BOOT" "$cmdline"
-
+    # initramfs MUST be built before grub-mkconfig / bootctl write kernel
+    # entries. Otherwise GRUB references an initrd that lacks the LUKS
+    # unlock hooks and the machine is unbootable on first reboot.
     if [[ "$ENCRYPT_MODE" != "none" ]]; then
         luks_configure_initramfs "$at_root" "$ENCRYPT_MODE"
     else
@@ -367,6 +423,9 @@ phase_bootloader_and_initramfs() {
             arch)   run chroot "$at_root" mkinitcpio -P ;;
         esac
     fi
+
+    bootloader_apply "$at_root" "${EFI_DEV:+$at_root/boot/efi}" "$BIOS_DISK" \
+        "$BOOTLOADER" "$INSTALL_BOOTLOADER" "$ENCRYPT_BOOT" "$cmdline"
 }
 
 phase_snapshots() {
@@ -412,12 +471,23 @@ phase_cleanup() {
 # -- Entry point -------------------------------------------------------------
 main() {
     parse_args "$@"
-    # Preflight happens as the invoking user (for live-ISO detection and
-    # $SUDO_USER awareness). After plan confirmation we re-exec via sudo.
-    phase_preflight
-    print_plan
-    confirm_plan
-    require_root_or_reexec "$@"
+
+    if [[ "${BTRFS_MIGRATE_REEXECED:-0}" != "1" ]]; then
+        # First invocation (as the invoking user). Run preflight so we can
+        # print an honest plan, confirm with the user, then sudo-re-exec.
+        phase_preflight
+        print_plan
+        confirm_plan
+        require_root_or_reexec "$@"   # exec sudo env -i -- "$self" "$@"
+        # If we fell through, we were already root and don't need the
+        # re-exec — so we still need detect_distro/exec_mode variables.
+    else
+        # Post-re-exec as root. Skip plan/confirm (already done) but we
+        # must re-populate DISTRO_*, EXEC_MODE and resolve SRC_MP/SUBVOLS
+        # because those live in process-local shell state, not env.
+        log "Resuming after sudo re-exec (root)."
+        phase_preflight
+    fi
 
     # From here on we're root.
     phase_encrypt

@@ -526,8 +526,10 @@ func (w *wizard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		w.input, cmd = w.input.Update(msg)
 	case stepEncrypt, stepEncryptBoot, stepBootloader, stepInstallBoot,
 		stepMountOpts, stepSnapshots, stepGrubBtrfs, stepConvertHome,
-		stepSafety, stepIntro, stepReview:
-		w.choice, cmd = w.choice.Update(msg)
+		stepSafety, stepReview:
+		if len(w.choice.Items()) > 0 {
+			w.choice, cmd = w.choice.Update(msg)
+		}
 	}
 	return w, cmd
 }

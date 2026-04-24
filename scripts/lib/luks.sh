@@ -50,6 +50,37 @@ luks_require_empty() {
     debug "Partition $dev is empty — safe to encrypt."
 }
 
+# luks_require_existing DEV — assert DEV is already a LUKS2 container.
+# Symmetric counterpart to luks_require_empty for the --luks-reuse path.
+luks_require_existing() {
+    local dev="$1"
+    require_partition "$dev"
+    local fs; fs=$(fs_of "$dev")
+    [[ "$fs" == "crypto_LUKS" ]] \
+        || die "Refusing --luks-reuse on $dev: blkid reports type='${fs:-none}', expected 'crypto_LUKS'. Drop --luks-reuse to format anew." 10
+    debug "Partition $dev is a LUKS container — safe to reuse."
+}
+
+# luks_open_existing DEV [KEYFILE] — open an existing LUKS2 container at
+# $CRYPT_NAME without reformatting. Used by the --luks-reuse path.
+# We deliberately call ONLY `cryptsetup open` here — never any header-
+# modifying subcommand (luksFormat / luksAddKey / luksKillSlot / luksErase).
+luks_open_existing() {
+    local dev="$1" keyfile="${2:-}"
+    luks_require_existing "$dev"
+
+    log "Opening existing LUKS2 container on $dev (reuse mode)"
+    if [[ -n "$keyfile" ]]; then
+        [[ -r "$keyfile" ]] || die "Keyfile not readable: $keyfile" 10
+        run cryptsetup open --type luks --key-file "$keyfile" -- "$dev" "$CRYPT_NAME"
+    else
+        run cryptsetup open --type luks -- "$dev" "$CRYPT_NAME"
+    fi
+    on_rollback -- cryptsetup close "$CRYPT_NAME"
+    [[ -b "/dev/mapper/$CRYPT_NAME" ]] || die "LUKS open did not produce /dev/mapper/$CRYPT_NAME" 30
+    ok "LUKS container open at /dev/mapper/$CRYPT_NAME (reused existing header)"
+}
+
 # luks_format DEV [KEYFILE] — format as LUKS2, then open at $CRYPT_NAME.
 # If KEYFILE is empty, prompts on the TTY (cryptsetup handles that).
 # Arguments:

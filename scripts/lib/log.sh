@@ -14,6 +14,14 @@ LOG_FILE="${LOG_FILE:-/var/log/btrfs-migrate.log}"
 LOG_LEVEL="${LOG_LEVEL:-info}"   # debug|info|warn|error
 DRY_RUN="${DRY_RUN:-0}"
 
+# --plan-only mode is a strict superset of dry-run: it records every
+# command that would run into a structured plan file and skips execution
+# entirely. Distinct from --dry-run, which still executes read-only
+# parts. Both env vars participate in run()'s short-circuit logic.
+BTRFS_MIGRATE_PLAN_ONLY="${BTRFS_MIGRATE_PLAN_ONLY:-0}"
+PLAN_FILE="${PLAN_FILE:-}"
+__plan_current_phase=""
+
 # Allowed prefixes for $LOG_FILE. We validate rather than trusting the env
 # so a hostile caller cannot redirect root appends into /etc/cron.d or
 # similar (H7 in the security audit).
@@ -117,9 +125,72 @@ die() {
     exit "$code"
 }
 
-# run CMD... — execute or, in dry-run, print only. Always logged.
+# plan_init — allocate the PLAN_FILE under a safe directory if plan-only
+# is active and PLAN_FILE wasn't pre-set. Idempotent.
+plan_init() {
+    (( BTRFS_MIGRATE_PLAN_ONLY == 1 )) || return 0
+    if [[ -z "$PLAN_FILE" ]]; then
+        PLAN_FILE=$(mktemp -t "btrfs-migrate-plan.XXXXXX.txt") || \
+            die "plan_init: mktemp failed" 30
+    fi
+    : >"$PLAN_FILE"
+    {
+        printf '# btrfs-migrate — execution plan\n'
+        printf '# generated %s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+        printf '# every command below WOULD run if --plan-only were dropped.\n\n'
+    } >>"$PLAN_FILE"
+}
+
+# plan_phase_header NAME — record a section header so the collected
+# commands group naturally under each phase. Called by main() before
+# every phase_* dispatch when plan-only is active.
+plan_phase_header() {
+    local name="$1"
+    __plan_current_phase="$name"
+    (( BTRFS_MIGRATE_PLAN_ONLY == 1 )) || return 0
+    printf '\n## PHASE %s\n' "$name" >>"$PLAN_FILE"
+}
+
+# plan_note ANNOTATION — append a free-form note line under the current
+# phase header (used for state-dependent commentary like "[only if X]").
+plan_note() {
+    (( BTRFS_MIGRATE_PLAN_ONLY == 1 )) || return 0
+    printf '# %s\n' "$*" >>"$PLAN_FILE"
+}
+
+# _plan_render_argv — produce a copy-pasteable shell representation of
+# argv. Quotes only when needed (whitespace, glob chars, shell metachars).
+_plan_render_argv() {
+    local out="" a needs_quote
+    local first=1
+    for a in "$@"; do
+        needs_quote=0
+        [[ "$a" =~ [^A-Za-z0-9_./:=@%+,-] ]] && needs_quote=1
+        [[ -z "$a" ]] && needs_quote=1
+        if (( first )); then first=0; else out+=' '; fi
+        if (( needs_quote == 1 )); then
+            # Single-quote and escape embedded single-quotes.
+            local esc="${a//\'/\'\\\'\'}"
+            out+="'$esc'"
+        else
+            out+="$a"
+        fi
+    done
+    printf '%s' "$out"
+}
+
+# run CMD... — execute or, in dry-run / plan-only, print only.
 # Sensitive paths registered via redact_add are masked in log output.
 run() {
+    if (( BTRFS_MIGRATE_PLAN_ONLY == 1 )); then
+        local rendered_plan; rendered_plan=$(_plan_render_argv "$@")
+        # Even in plan-mode, the redact list applies — keyfile paths
+        # should not show up in the artifact unless the operator wants them.
+        rendered_plan=$(_redacted "$rendered_plan")
+        printf '%s\n' "$rendered_plan" >>"$PLAN_FILE"
+        _log debug "PLAN: $rendered_plan"
+        return 0
+    fi
     local rendered; rendered=$(_redacted "$*")
     if (( DRY_RUN == 1 )); then
         _log info "DRY-RUN: $rendered"
@@ -130,10 +201,14 @@ run() {
 }
 
 # write_file PATH CONTENT — atomically create/overwrite PATH with CONTENT
-# (no shell interpolation of the content). Honours DRY_RUN. Uses tee
-# internally so content arrives on stdin and cannot be re-parsed.
+# (no shell interpolation of the content). Honours DRY_RUN and plan-only.
+# Uses tee internally so content arrives on stdin and cannot be re-parsed.
 write_file() {
     local path="$1" content="$2"
+    if (( BTRFS_MIGRATE_PLAN_ONLY == 1 )); then
+        printf '# write_file %s (%d bytes)\n' "$path" "${#content}" >>"$PLAN_FILE"
+        return 0
+    fi
     if (( DRY_RUN == 1 )); then
         _log info "DRY-RUN: write_file $path (${#content} bytes)"
         return 0
@@ -143,9 +218,13 @@ write_file() {
 }
 
 # append_file PATH CONTENT — append CONTENT to PATH (no shell interpolation
-# of the content). Honours DRY_RUN.
+# of the content). Honours DRY_RUN and plan-only.
 append_file() {
     local path="$1" content="$2"
+    if (( BTRFS_MIGRATE_PLAN_ONLY == 1 )); then
+        printf '# append_file %s (%d bytes)\n' "$path" "${#content}" >>"$PLAN_FILE"
+        return 0
+    fi
     if (( DRY_RUN == 1 )); then
         _log info "DRY-RUN: append_file $path (${#content} bytes)"
         return 0
@@ -156,6 +235,12 @@ append_file() {
 
 # run_quiet CMD... — like run, but stdout goes only to the log file.
 run_quiet() {
+    if (( BTRFS_MIGRATE_PLAN_ONLY == 1 )); then
+        local rendered_plan; rendered_plan=$(_plan_render_argv "$@")
+        rendered_plan=$(_redacted "$rendered_plan")
+        printf '%s\n' "$rendered_plan" >>"$PLAN_FILE"
+        return 0
+    fi
     local rendered; rendered=$(_redacted "$*")
     if (( DRY_RUN == 1 )); then
         _log info "DRY-RUN: $rendered"
@@ -298,6 +383,8 @@ require_root_or_reexec() {
         BTRFS_MIGRATE_REEXECED=1 \
         ${forwarded_log:+LOG_FILE="$forwarded_log"} \
         DRY_RUN="$DRY_RUN" \
+        BTRFS_MIGRATE_PLAN_ONLY="$BTRFS_MIGRATE_PLAN_ONLY" \
+        ${PLAN_FILE:+PLAN_FILE="$PLAN_FILE"} \
         LOG_LEVEL="$LOG_LEVEL" \
         ${grub_btrfs_repo:+GRUB_BTRFS_REPO="$grub_btrfs_repo"} \
         ${btrfs_assistant_repo:+BTRFS_ASSISTANT_REPO="$btrfs_assistant_repo"} \

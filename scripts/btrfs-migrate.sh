@@ -57,6 +57,9 @@ ASSUME_YES=0
 SRC_MP=""                   # explicit source root mountpoint (optional)
 BIOS_DISK=""                # whole-disk for BIOS grub-install (e.g. /dev/sda)
 LUKS_KEYFILE=""             # optional; enables fully-unattended LUKS format
+PLAN_ONLY=0                 # 1 = collect plan to file, execute nothing
+LUKS_REUSE=0                # 1 = open existing LUKS instead of luksFormat
+ACCEPT_HOME_PLAINTEXT=0     # 1 = ack plaintext /home with encrypted root
 
 show_help() {
     cat <<EOF
@@ -112,10 +115,21 @@ ENCRYPTION (unattended):
                         runs when combined with --yes --i-have-backups.
 
 SAFETY:
-  --dry-run             Print the plan, don't touch anything.
+  --dry-run             Log every command as DRY-RUN (still executes
+                        read-only probes). For a non-executing review
+                        artifact, prefer --plan-only.
+  --plan-only           Collect every command this run would execute into
+                        a plan file (path printed on stdout); do not
+                        touch any disk. Distinct from --dry-run.
   --force-installed     Allow running on an installed system (not recommended).
   --i-have-backups      Required for destructive execution.
   --yes                 Non-interactive. Skip plan confirmation.
+  --luks-reuse          Reuse an existing LUKS2 container on --root
+                        instead of formatting it. Requires --encrypt
+                        luks|lvm-luks; in --yes mode requires --luks-key-file.
+  --accept-home-plaintext
+                        Acknowledge that converting a plaintext separate
+                        /home while root is encrypted is intentional.
 
   --help, -h            This help.
   --version, -V         Print version and exit.
@@ -148,6 +162,9 @@ parse_args() {
             --convert-home)      CONVERT_HOME=1; shift ;;
             --mount-opts)        MOUNT_OPTS_MODE="$2"; shift 2 ;;
             --dry-run)           DRY_RUN=1; shift ;;
+            --plan-only)         PLAN_ONLY=1; shift ;;
+            --luks-reuse)        LUKS_REUSE=1; shift ;;
+            --accept-home-plaintext) ACCEPT_HOME_PLAINTEXT=1; shift ;;
             --force-installed)   FORCE_INSTALLED=1; shift ;;
             --i-have-backups)    I_HAVE_BACKUPS=1; shift ;;
             --yes|-y)            ASSUME_YES=1; shift ;;
@@ -156,7 +173,16 @@ parse_args() {
             *) die "Unknown argument: $1 (try --help)" 10 ;;
         esac
     done
-    export DRY_RUN   # log.sh reads this
+
+    # --plan-only is mutually exclusive with --dry-run (different intent)
+    # and with --yes (plan-only never executes, so confirmation is moot).
+    if (( PLAN_ONLY == 1 )); then
+        (( DRY_RUN == 0 )) || die "--plan-only and --dry-run are mutually exclusive." 10
+        (( ASSUME_YES == 0 )) || die "--plan-only does not execute; --yes is meaningless here." 10
+    fi
+    BTRFS_MIGRATE_PLAN_ONLY="$PLAN_ONLY"
+    export DRY_RUN BTRFS_MIGRATE_PLAN_ONLY   # log.sh reads these
+    plan_init   # no-op unless plan-only
 }
 
 # -- Validation --------------------------------------------------------------
@@ -227,9 +253,23 @@ validate_args() {
     btrfs_validate_subvols "${SUBVOLS[@]}"
     (( WANT_TIMESHIFT == 1 )) && snap_warn_layout_for_timeshift "${SUBVOLS[@]}"
 
-    # Encryption + data-present is a hard refusal.
+    # --luks-reuse requires --encrypt and (in unattended mode) a keyfile.
+    if (( LUKS_REUSE == 1 )); then
+        [[ "$ENCRYPT_MODE" != "none" ]] \
+            || die "--luks-reuse requires --encrypt luks|lvm-luks." 10
+        if (( ASSUME_YES == 1 )) && [[ -z "$LUKS_KEYFILE" ]]; then
+            die "--luks-reuse with --yes requires --luks-key-file (cryptsetup open would otherwise prompt and hang)." 10
+        fi
+    fi
+
+    # Encryption: with reuse we require an EXISTING container; without
+    # reuse we require an EMPTY partition. Both paths refuse data-present.
     if [[ "$ENCRYPT_MODE" != "none" ]]; then
-        luks_require_empty "$ROOT_DEV"
+        if (( LUKS_REUSE == 1 )); then
+            luks_require_existing "$ROOT_DEV"
+        else
+            luks_require_empty "$ROOT_DEV"
+        fi
     fi
 
     # Keyfile (if given): must exist, be owned by root, and be 0600/0400.
@@ -243,6 +283,19 @@ validate_args() {
     # will prompt interactively and hang.
     if (( ASSUME_YES == 1 )) && [[ "$ENCRYPT_MODE" != "none" ]] && [[ -z "$LUKS_KEYFILE" ]]; then
         warn "--yes with encryption but no --luks-key-file: cryptsetup will still prompt for a passphrase on the TTY."
+    fi
+
+    # /home encryption-posture mismatch: root LUKS + plaintext separate /home
+    # is almost always a misconfiguration. Warn if the operator is keeping
+    # the partition as-is; refuse if they're converting it without ack.
+    if [[ "$ENCRYPT_MODE" != "none" ]] && [[ -n "$SEP_HOME_DEV" ]]; then
+        local home_fs; home_fs=$(fs_of "$SEP_HOME_DEV")
+        if [[ "$home_fs" != "crypto_LUKS" ]]; then
+            if (( CONVERT_HOME == 1 )) && (( ACCEPT_HOME_PLAINTEXT == 0 )); then
+                die "Encryption mismatch: --encrypt $ENCRYPT_MODE on root but --sep-home $SEP_HOME_DEV is plaintext (fs='${home_fs:-none}'). Converting it would leave /home unencrypted at rest. Pass --accept-home-plaintext to confirm intent." 10
+            fi
+            warn "Encryption mismatch: root is encrypted ($ENCRYPT_MODE) but separate /home ($SEP_HOME_DEV, fs='${home_fs:-none}') is plaintext. /home contents will NOT be protected at rest."
+        fi
     fi
 }
 
@@ -281,6 +334,10 @@ EOF
 }
 
 confirm_plan() {
+    if (( BTRFS_MIGRATE_PLAN_ONLY == 1 )); then
+        log "Plan-only — nothing will be changed; commands will be collected to $PLAN_FILE."
+        return 0
+    fi
     if (( DRY_RUN == 1 )); then
         log "Dry run — nothing will be changed."
         return 0
@@ -333,13 +390,37 @@ phase_preflight() {
     validate_args
     auto_pick_src_mp
     ensure_bins lsblk blkid findmnt rsync btrfs awk sed install mount umount cp mv chmod chown
+
+    # Environmental validators (feed the grouped pf_report collector).
+    # Errors from individual checks are suppressed so every check runs
+    # and every failure shows up in the final report.
+    pf_report_reset
+    local dev
+    for dev in "$ROOT_DEV" "$BOOT_DEV" "$EFI_DEV" "$SEP_HOME_DEV"; do
+        [[ -z "$dev" ]] && continue
+        require_not_mounted "$dev"       || true
+        require_device_not_in_use "$dev" || true
+    done
+    # Size check only against --root — the other devices are not receiving
+    # the rsync payload.
+    require_device_size_sufficient "$SRC_MP" "$ROOT_DEV" || true
+    pf_report_emit
 }
 
 phase_encrypt() {
     [[ "$ENCRYPT_MODE" == "none" ]] && return 0
     luks_tools_installed "$ENCRYPT_MODE"
-    luks_format "$ROOT_DEV" "$LUKS_KEYFILE"
+    if (( LUKS_REUSE == 1 )); then
+        luks_open_existing "$ROOT_DEV" "$LUKS_KEYFILE"
+    else
+        luks_format "$ROOT_DEV" "$LUKS_KEYFILE"
+    fi
     if [[ "$ENCRYPT_MODE" == "lvm-luks" ]]; then
+        # In reuse mode the LVM stack is also expected to already exist.
+        # We still run `pvcreate -ff` etc; that is destructive but matches
+        # the operator's stated intent (reuse the LUKS, build LVM fresh
+        # on top). A future enhancement could detect-and-skip; for now
+        # this is documented in docs/ENCRYPTION.md.
         luks_provision_lvm
     fi
 }
@@ -363,6 +444,8 @@ phase_migrate_data() {
     btrfs_verify_home_ownership "$TARGET_MP"
     # Separate-/home branch:
     btrfs_home_strategy "$SRC_MP" "$SEP_HOME_DEV" "$TARGET_MP" "$CONVERT_HOME"
+    # Fail fast if the copy is incomplete despite rsync's 0 exit.
+    btrfs_postmigrate_check "$TARGET_MP" "$BOOT_DEV"
 }
 
 phase_fstab() {
@@ -448,6 +531,12 @@ phase_verify() {
         [[ -n "$uid_want" && "$uid_have" == "$uid_want" ]] || \
             die "Post-check: /home/$USERNAME owner uid=$uid_have, passwd says $uid_want." 40
     fi
+
+    # Bootloader entries must be recognized by the loader before we declare
+    # success; a silently-malformed systemd-boot entry leaves the system
+    # unbootable even though every prior phase succeeded.
+    bootloader_verify_entries "$at_root" "$BOOTLOADER"
+
     ok "Post-migration verification passed."
 }
 
@@ -475,29 +564,43 @@ main() {
     if [[ "${BTRFS_MIGRATE_REEXECED:-0}" != "1" ]]; then
         # First invocation (as the invoking user). Run preflight so we can
         # print an honest plan, confirm with the user, then sudo-re-exec.
+        plan_phase_header preflight
         phase_preflight
         print_plan
         confirm_plan
+        # Plan-only: collect commands across remaining phases without
+        # executing them. We still need root to faithfully render commands
+        # that probe state (lsblk/findmnt are read-only but would mismatch
+        # under sudo permissions). Re-exec normally; child will re-enter
+        # this branch with BTRFS_MIGRATE_REEXECED=1 and continue.
         require_root_or_reexec "$@"   # exec sudo env -i -- "$self" "$@"
-        # If we fell through, we were already root and don't need the
-        # re-exec — so we still need detect_distro/exec_mode variables.
     else
         # Post-re-exec as root. Skip plan/confirm (already done) but we
         # must re-populate DISTRO_*, EXEC_MODE and resolve SRC_MP/SUBVOLS
         # because those live in process-local shell state, not env.
         log "Resuming after sudo re-exec (root)."
+        plan_phase_header preflight
         phase_preflight
     fi
 
     # From here on we're root.
-    phase_encrypt
-    phase_mkfs_and_subvols
-    phase_migrate_data
-    phase_fstab
-    phase_bootloader_and_initramfs
-    phase_snapshots
-    phase_verify
-    phase_cleanup
+    plan_phase_header encrypt;                phase_encrypt
+    plan_phase_header mkfs_and_subvols;       phase_mkfs_and_subvols
+    plan_phase_header migrate_data;           phase_migrate_data
+    plan_phase_header fstab;                  phase_fstab
+    plan_phase_header bootloader_and_initramfs; phase_bootloader_and_initramfs
+    plan_phase_header snapshots;              phase_snapshots
+
+    if (( BTRFS_MIGRATE_PLAN_ONLY == 1 )); then
+        # phase_verify probes the populated tree — meaningless without
+        # actual execution. Same for phase_cleanup's unmounts.
+        printf '\nPlan written to %s\n' "$PLAN_FILE"
+        ok "Plan-only complete. Review the file above, then re-run without --plan-only to execute."
+        return 0
+    fi
+
+    plan_phase_header verify;  phase_verify
+    plan_phase_header cleanup; phase_cleanup
     ok "Done. Reboot to use your new Btrfs root."
 }
 

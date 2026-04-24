@@ -271,3 +271,148 @@ require_user() {
     local uid; uid=$(cut -d: -f3 <<<"$entry")
     (( uid >= 1000 )) || die "User '$name' has uid=$uid; must be a regular user (uid>=1000)." 10
 }
+
+# -- Preflight report collector ---------------------------------------------
+# Validators that want to participate in the grouped summary at the end of
+# preflight call pf_report_add <OK|FAIL> <check-name> <detail>. pf_report_emit
+# prints the collected results; if any FAILs were recorded it dies after
+# printing so the operator sees every problem at once instead of hitting one
+# die per run.
+declare -a __pf_report=()
+__pf_report_failures=0
+
+pf_report_reset() {
+    __pf_report=()
+    __pf_report_failures=0
+}
+
+pf_report_add() {
+    local result="$1" name="$2" detail="${3:-}"
+    case "$result" in
+        OK|FAIL) : ;;
+        *) die "pf_report_add: bad result '$result' (want OK|FAIL)" 2 ;;
+    esac
+    __pf_report+=("${result}|${name}|${detail}")
+    [[ "$result" == "FAIL" ]] && __pf_report_failures=$(( __pf_report_failures + 1 ))
+}
+
+pf_report_emit() {
+    local entry parts result name detail
+    printf '\n===== Preflight report =====\n' >&2
+    for entry in "${__pf_report[@]}"; do
+        # Split on '|' using parameter expansion so details containing
+        # spaces survive intact.
+        result="${entry%%|*}"
+        parts="${entry#*|}"
+        name="${parts%%|*}"
+        detail="${parts#*|}"
+        [[ "$detail" == "$parts" ]] && detail=""
+        case "$result" in
+            OK)   printf '  [%sOK%s] %s%s\n' "$_C_GRN" "$_C_RESET" "$name" "${detail:+ — $detail}" >&2 ;;
+            FAIL) printf '  [%sFAIL%s] %s%s\n' "$_C_RED" "$_C_RESET" "$name" "${detail:+ — $detail}" >&2 ;;
+        esac
+    done
+    if (( __pf_report_failures > 0 )); then
+        die "Preflight: $__pf_report_failures check(s) failed. Fix the issues above and retry." 10
+    fi
+    printf '  Preflight: all checks passed.\n\n' >&2
+}
+
+# -- Environmental validators (feed the pf_report collector) ------------------
+
+# require_not_mounted DEV — fail if DEV is currently mounted anywhere.
+# Uses findmnt --source, which resolves the device to its canonical form.
+require_not_mounted() {
+    local dev="$1" mp=""
+    [[ -n "$dev" ]] || return 0
+    mp=$(findmnt -nro TARGET --source "$dev" 2>/dev/null | head -n1 || true)
+    if [[ -n "$mp" ]]; then
+        pf_report_add FAIL "not-mounted:$dev" "currently mounted at $mp — unmount first (live ISO recommended)"
+        return 1
+    fi
+    pf_report_add OK "not-mounted:$dev"
+    return 0
+}
+
+# require_device_not_in_use DEV — fail if DEV is held open by LVM (PV of a
+# VG), md-raid, active dm-crypt, or listed in /proc/swaps. Reads
+# /sys/class/block/<basename>/holders/ to enumerate holders.
+require_device_not_in_use() {
+    local dev="$1"
+    [[ -n "$dev" ]] || return 0
+
+    # swap first — cheapest check, and operators hit this often.
+    if awk 'NR>1 {print $1}' /proc/swaps 2>/dev/null | grep -Fxq -- "$dev"; then
+        pf_report_add FAIL "not-in-use:$dev" "active swap — swapoff $dev first"
+        return 1
+    fi
+
+    # Holders (LVM PV, md member, unlocked LUKS, active dm-crypt).
+    local base; base=$(basename -- "$dev")
+    local holders_dir="/sys/class/block/$base/holders"
+    if [[ -d "$holders_dir" ]]; then
+        local holders; holders=$(find "$holders_dir" -mindepth 1 -maxdepth 1 -printf '%f\n' 2>/dev/null || true)
+        if [[ -n "$holders" ]]; then
+            # Classify the first holder to produce a useful message.
+            local first; first=$(head -n1 <<<"$holders")
+            local kind="unknown" label=""
+            if [[ "$first" == dm-* ]]; then
+                # LVM LV or dm-crypt? pvs / dmsetup give richer labels.
+                if have dmsetup; then
+                    label=$(dmsetup info -c --noheadings -o name "/dev/$first" 2>/dev/null || true)
+                fi
+                if have pvs && pvs --noheadings -o vg_name -- "$dev" 2>/dev/null | grep -q '[^[:space:]]'; then
+                    kind="LVM PV"
+                    label=$(pvs --noheadings -o vg_name -- "$dev" 2>/dev/null | awk '{print $1}')
+                    pf_report_add FAIL "not-in-use:$dev" "LVM PV of VG '$label' — vgchange -an '$label' && pvremove '$dev' first"
+                    return 1
+                fi
+                kind="dm-mapper holder"
+            elif [[ "$first" == md* ]]; then
+                kind="md-raid member of /dev/$first"
+            fi
+            pf_report_add FAIL "not-in-use:$dev" "${kind}${label:+ ($label)}"
+            return 1
+        fi
+    fi
+    pf_report_add OK "not-in-use:$dev"
+    return 0
+}
+
+# require_device_size_sufficient SRC_MP DEV — fail if the target DEV's raw
+# capacity is less than (source-data-size * 1.10). The estimate is coarse on
+# purpose; it catches order-of-magnitude mistakes, not byte-precision
+# provisioning.
+require_device_size_sufficient() {
+    local src_mp="$1" dev="$2"
+    [[ -n "$dev" ]] || return 0
+    if ! have blockdev; then
+        pf_report_add OK "size-fits:$dev" "skipped (blockdev not available)"
+        return 0
+    fi
+    if [[ ! -d "$src_mp" ]]; then
+        pf_report_add OK "size-fits:$dev" "skipped (source mp '$src_mp' missing)"
+        return 0
+    fi
+    local src_kib dev_bytes
+    # du outputs KiB by default; --one-file-system ensures we don't wander
+    # into /proc, /sys, /dev bind mounts, etc.
+    src_kib=$(du -s --one-file-system -- "$src_mp" 2>/dev/null | awk '{print $1}')
+    dev_bytes=$(blockdev --getsize64 -- "$dev" 2>/dev/null || echo 0)
+    if [[ -z "$src_kib" || "$dev_bytes" == "0" ]]; then
+        pf_report_add OK "size-fits:$dev" "skipped (measurement failed)"
+        return 0
+    fi
+    # src_bytes = src_kib * 1024; required = src_bytes + 10%.
+    local src_bytes required
+    src_bytes=$(( src_kib * 1024 ))
+    required=$(( src_bytes + src_bytes / 10 ))
+    if (( dev_bytes < required )); then
+        pf_report_add FAIL "size-fits:$dev" \
+            "target=$(( dev_bytes / 1024 / 1024 )) MiB < required=$(( required / 1024 / 1024 )) MiB (source=$(( src_bytes / 1024 / 1024 )) MiB + 10%)"
+        return 1
+    fi
+    pf_report_add OK "size-fits:$dev" \
+        "target=$(( dev_bytes / 1024 / 1024 )) MiB >= required=$(( required / 1024 / 1024 )) MiB"
+    return 0
+}

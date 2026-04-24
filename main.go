@@ -177,29 +177,32 @@ func findScript() (string, error) {
 }
 
 type plan struct {
-	RootDev        string
-	BootDev        string
-	EfiDev         string
-	SepHomeDev     string
-	BiosDisk       string
-	User           string
-	Subvols        string
-	Encrypt        string
-	LuksKeyFile    string
-	EncryptBoot    bool
-	Bootloader     string
-	InstallBoot    bool
-	Snapper        bool
-	SnapperHome    bool
-	Timeshift      bool
-	GrubBtrfs      bool
-	BtrfsAssistant bool
-	ConvertHome    bool
-	MountOpts      string
-	DryRun         bool
-	ForceInstalled bool
-	HaveBackups    bool
-	Yes            bool
+	RootDev             string
+	BootDev             string
+	EfiDev              string
+	SepHomeDev          string
+	BiosDisk            string
+	User                string
+	Subvols             string
+	Encrypt             string
+	LuksKeyFile         string
+	LuksReuse           bool
+	EncryptBoot         bool
+	Bootloader          string
+	InstallBoot         bool
+	Snapper             bool
+	SnapperHome         bool
+	Timeshift           bool
+	GrubBtrfs           bool
+	BtrfsAssistant      bool
+	ConvertHome         bool
+	AcceptHomePlaintext bool
+	MountOpts           string
+	DryRun              bool
+	PlanOnly            bool
+	ForceInstalled      bool
+	HaveBackups         bool
+	Yes                 bool
 }
 
 func (p plan) toArgs() []string {
@@ -225,6 +228,7 @@ func (p plan) toArgs() []string {
 		a = append(a, "--encrypt", p.Encrypt)
 	}
 	add("--luks-key-file", p.LuksKeyFile)
+	addBool("--luks-reuse", p.LuksReuse)
 	addBool("--encrypt-boot", p.EncryptBoot)
 	add("--bootloader", p.Bootloader)
 	addBool("--install-bootloader", p.InstallBoot)
@@ -234,8 +238,10 @@ func (p plan) toArgs() []string {
 	addBool("--grub-btrfs", p.GrubBtrfs)
 	addBool("--btrfs-assistant", p.BtrfsAssistant)
 	addBool("--convert-home", p.ConvertHome)
+	addBool("--accept-home-plaintext", p.AcceptHomePlaintext)
 	add("--mount-opts", p.MountOpts)
 	addBool("--dry-run", p.DryRun)
+	addBool("--plan-only", p.PlanOnly)
 	addBool("--force-installed", p.ForceInstalled)
 	addBool("--i-have-backups", p.HaveBackups)
 	addBool("--yes", p.Yes)
@@ -254,6 +260,7 @@ const (
 	stepUser
 	stepSubvols
 	stepEncrypt
+	stepLuksReuse
 	stepLuksKeyFile
 	stepEncryptBoot
 	stepBootloader
@@ -277,9 +284,10 @@ type stepMeta struct {
 // progress indicator and for computing step numbers ("2/14").
 var stepOrder = []stepID{
 	stepIntro, stepRoot, stepBoot, stepEfi, stepSepHome, stepBiosDisk,
-	stepUser, stepSubvols, stepEncrypt, stepLuksKeyFile, stepEncryptBoot,
-	stepBootloader, stepInstallBoot, stepMountOpts, stepSnapshots,
-	stepGrubBtrfs, stepConvertHome, stepSafety, stepReview, stepDone,
+	stepUser, stepSubvols, stepEncrypt, stepLuksReuse, stepLuksKeyFile,
+	stepEncryptBoot, stepBootloader, stepInstallBoot, stepMountOpts,
+	stepSnapshots, stepGrubBtrfs, stepConvertHome, stepSafety, stepReview,
+	stepDone,
 }
 
 var stepMetaFor = map[stepID]stepMeta{
@@ -292,6 +300,7 @@ var stepMetaFor = map[stepID]stepMeta{
 	stepUser:        {"Primary user", "Used to repair /home/<name> ownership (issue #2 fix)."},
 	stepSubvols:     {"Subvolume layout", "Comma-separated list. Empty keeps the upstream default set."},
 	stepEncrypt:     {"Encryption mode", "Encryption is only offered for EMPTY target partitions."},
+	stepLuksReuse:   {"Existing LUKS container?", "Reuse an already-formatted LUKS2 on --root instead of formatting fresh."},
 	stepLuksKeyFile: {"LUKS keyfile", "A 0600 file read by cryptsetup — enables fully non-interactive runs."},
 	stepEncryptBoot: {"Encrypt /boot?", "GRUB only. systemd-boot cannot prompt for /boot passphrases."},
 	stepBootloader:  {"Bootloader", "GRUB or systemd-boot. Both installed-or-configure-only."},
@@ -566,6 +575,11 @@ func (w *wizard) restoreStep() {
 			{title: "luks", desc: "LUKS2 on the root partition (must be empty)."},
 			{title: "lvm-luks", desc: "LVM inside LUKS2 (must be empty)."},
 		})
+	case stepLuksReuse:
+		w.setChoices("Existing LUKS container on --root?", []simpleItem{
+			{title: "format-fresh", desc: "Create a new LUKS2 container (target partition must be EMPTY)."},
+			{title: "reuse-existing", desc: "Reuse an existing LUKS2 container (don't reformat the header)."},
+		})
 	case stepEncryptBoot:
 		w.setChoices("Encrypt /boot?", []simpleItem{
 			{title: "no", desc: "Leave /boot unencrypted."},
@@ -609,7 +623,8 @@ func (w *wizard) restoreStep() {
 		})
 	case stepSafety:
 		w.setChoices("Safety gates", []simpleItem{
-			{title: "plan", desc: "Print the plan only (--dry-run)."},
+			{title: "plan-only", desc: "Collect the plan to a file; execute nothing."},
+			{title: "dry-run", desc: "Log every command as DRY-RUN."},
 			{title: "execute", desc: "I have backups."},
 			{title: "execute (--force-installed)", desc: "Allow installed system."},
 		})
@@ -689,6 +704,7 @@ func (w *wizard) advance() (tea.Model, tea.Cmd) {
 		w.recordAdvance()
 		if w.plan.Encrypt == "none" {
 			w.plan.LuksKeyFile = ""
+			w.plan.LuksReuse = false
 			w.plan.EncryptBoot = false
 			w.step = stepBootloader
 			w.setChoices("Bootloader", []simpleItem{
@@ -696,8 +712,20 @@ func (w *wizard) advance() (tea.Model, tea.Cmd) {
 				{title: "systemd-boot", desc: "systemd-boot. Incompatible with encrypted /boot."},
 			})
 		} else {
-			w.step = stepLuksKeyFile
-			w.input.SetValue(w.plan.LuksKeyFile)
+			w.step = stepLuksReuse
+			w.setChoices("Existing LUKS container on --root?", []simpleItem{
+				{title: "format-fresh", desc: "Create a new LUKS2 container (target partition must be EMPTY)."},
+				{title: "reuse-existing", desc: "Reuse an existing LUKS2 container (don't reformat the header)."},
+			})
+		}
+	case stepLuksReuse:
+		w.plan.LuksReuse = w.choice.SelectedItem().(simpleItem).title == "reuse-existing"
+		w.recordAdvance()
+		w.step = stepLuksKeyFile
+		w.input.SetValue(w.plan.LuksKeyFile)
+		if w.plan.LuksReuse {
+			w.input.Placeholder = "REQUIRED for --yes runs; else blank to prompt interactively"
+		} else {
 			w.input.Placeholder = "blank to prompt interactively, else path to 0600 keyfile"
 		}
 	case stepLuksKeyFile:
@@ -771,7 +799,8 @@ func (w *wizard) advance() (tea.Model, tea.Cmd) {
 			w.plan.ConvertHome = false
 			w.step = stepSafety
 			w.setChoices("Safety gates", []simpleItem{
-				{title: "plan", desc: "Print the plan only (--dry-run); no disk changes."},
+				{title: "plan-only", desc: "Collect the plan to a file (--plan-only); execute nothing."},
+				{title: "dry-run", desc: "Log every command as DRY-RUN; still probes read-only state."},
 				{title: "execute", desc: "I have backups AND understand this is destructive."},
 				{title: "execute (--force-installed)", desc: "Allow running on an installed system."},
 			})
@@ -791,19 +820,22 @@ func (w *wizard) advance() (tea.Model, tea.Cmd) {
 			{title: "execute (--force-installed)", desc: "Allow running on an installed system."},
 		})
 	case stepSafety:
+		// Reset all four flags so back-navigation cleanly re-applies one
+		// of the four mutually-exclusive modes.
+		w.plan.PlanOnly = false
+		w.plan.DryRun = false
+		w.plan.HaveBackups = false
+		w.plan.ForceInstalled = false
+		w.plan.Yes = false
 		switch w.choice.SelectedItem().(simpleItem).title {
-		case "plan":
+		case "plan-only":
+			w.plan.PlanOnly = true
+		case "dry-run":
 			w.plan.DryRun = true
-			w.plan.HaveBackups = false
-			w.plan.ForceInstalled = false
-			w.plan.Yes = false
 		case "execute":
-			w.plan.DryRun = false
 			w.plan.HaveBackups = true
-			w.plan.ForceInstalled = false
 			w.plan.Yes = true
 		case "execute (--force-installed)":
-			w.plan.DryRun = false
 			w.plan.HaveBackups = true
 			w.plan.ForceInstalled = true
 			w.plan.Yes = true

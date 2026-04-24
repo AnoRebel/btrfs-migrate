@@ -146,6 +146,23 @@ sudo ./btrfs-migrate --non-interactive \
   --yes --i-have-backups
 ```
 
+## Further reading
+
+Operator-facing documentation lives under `docs/`:
+
+- [`docs/ENCRYPTION.md`](docs/ENCRYPTION.md) — what LUKS topologies are
+  supported, what's intentionally out of scope, and how to handle
+  edge cases via `--luks-reuse`.
+- [`docs/RECOVERY.md`](docs/RECOVERY.md) — what to do when a phase
+  fails mid-run: reading the rollback log, manual undo commands,
+  chrooting into the new system.
+- [`docs/PITFALLS.md`](docs/PITFALLS.md) — common footguns (mounted
+  targets, UID shifts, systemd-boot multi-kernel gotchas, rsync
+  exit-code trust).
+- [`docs/DISTRO-DIFFERENCES.md`](docs/DISTRO-DIFFERENCES.md) —
+  Ubuntu 24.04+ vs Arch: package managers, initramfs tools,
+  bootloader defaults, snapshot-tool availability.
+
 ## License
 
 MIT. See `LICENSE`. Upstream script by Diogo Pessoa; rewrite by Ano Rebel.

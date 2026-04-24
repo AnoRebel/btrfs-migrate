@@ -172,9 +172,74 @@ grub_install() {
 
 # -- systemd-boot ------------------------------------------------------------
 
+# sdboot_enumerate_kernels ROOT_MP — print one line per discovered kernel
+# under @/boot. Format: BASENAME<TAB>VMLINUZ_REL<TAB>INITRD_REL where the
+# *_REL paths are relative to the boot directory the loader will see at
+# runtime ("/" inside the ESP for systemd-boot, which canonically expects
+# /vmlinuz-* and /initramfs-* style relative paths).
+#
+# We pair each vmlinuz-<basename> with its initramfs by trying the common
+# naming conventions:
+#   Arch:    /boot/initramfs-<basename>.img
+#   Ubuntu:  /boot/initrd.img-<basename>
+sdboot_enumerate_kernels() {
+    local root_mp="$1"
+    local boot="$root_mp/boot"
+    [[ -d "$boot" ]] || return 0
+    local k base initrd_rel
+    for k in "$boot"/vmlinuz-*; do
+        [[ -e "$k" ]] || continue
+        base="${k##*/vmlinuz-}"
+        # Skip fallback / rescue images as primary entries; they will get
+        # their own line via the wildcard if they're real kernels too.
+        case "$base" in
+            *.img|*.efi) continue ;;
+        esac
+        initrd_rel=""
+        if   [[ -e "$boot/initramfs-$base.img" ]]; then initrd_rel="/initramfs-$base.img"
+        elif [[ -e "$boot/initrd.img-$base"   ]]; then initrd_rel="/initrd.img-$base"
+        elif [[ -e "$boot/initramfs-$base"     ]]; then initrd_rel="/initramfs-$base"
+        fi
+        printf '%s\t/vmlinuz-%s\t%s\n' "$base" "$base" "$initrd_rel"
+    done
+}
+
+# sdboot_write_entry EFI_MP BASENAME VMLINUZ_REL INITRD_REL CMDLINE — write
+# a single loader entry. The entry filename is btrfs-migrate-<basename>.conf
+# under EFI_MP/loader/entries/. INITRD_REL may be empty (no initrd line).
+sdboot_write_entry() {
+    local efi_mp="$1" base="$2" vmlinuz_rel="$3" initrd_rel="$4" cmdline="$5"
+    # Constrain basename to a tame token — it becomes a filename + a key
+    # in loader.conf and we don't want shell metachars or path separators.
+    [[ "$base" =~ ^[A-Za-z0-9._+-]+$ ]] || die "sdboot_write_entry: refusing unsafe basename '$base'" 10
+    local entries_dir="$efi_mp/loader/entries"
+    run mkdir -p "$entries_dir"
+    local entry="$entries_dir/btrfs-migrate-$base.conf"
+    local arch; arch=$(uname -m)
+    local body="title   btrfs-migrate $base ($arch)
+linux   $vmlinuz_rel
+"
+    [[ -n "$initrd_rel" ]] && body+="initrd  $initrd_rel
+"
+    body+="options $cmdline rw
+"
+    write_file "$entry" "$body"
+    log "Wrote systemd-boot entry: $(basename -- "$entry")"
+}
+
+# _sdboot_pick_default BASENAMES... — choose the highest version-sorted
+# kernel basename as the loader.conf default. version-sort puts e.g.
+# 6.9.0 ahead of 6.6.0, and 'linux' ahead of 'linux-lts' alphabetically
+# only when versions are equal (good enough; operators can edit).
+_sdboot_pick_default() {
+    printf '%s\n' "$@" | sort -V | tail -n1
+}
+
 # sdboot_install ROOT_MP EFI_MP — bootctl install into the target ESP,
-# generate a /boot/loader/entries/<id>.conf for the default kernel.
-# Caller must have validated that encrypted /boot is NOT set.
+# enumerate every kernel under @/boot, write one loader entry per kernel
+# (Arch: linux + linux-lts case; Ubuntu: per-version case), choose the
+# newest as default in loader.conf. Caller must have validated that
+# encrypted /boot is NOT set.
 sdboot_install() {
     local root_mp="$1" efi_mp="$2" install="${3:-0}" cmdline="${4:-}"
     [[ -n "$efi_mp" ]] || die "systemd-boot requires an EFI partition (--efi)." 10
@@ -194,30 +259,102 @@ sdboot_install() {
             warn "bootctl update failed — ESP may not yet have systemd-boot installed."
     fi
 
-    # Write a basic loader entry. Real kernel/initramfs paths differ per
-    # distro, so we emit pointers to the canonical ones and let the user
-    # refine.
     local loader_dir="$root_mp/boot/efi/loader"
     run mkdir -p "$loader_dir/entries"
-    write_file "$loader_dir/loader.conf" 'default  btrfs-migrate.conf
+
+    # Enumerate kernels. If none are found (e.g. plan-only with empty
+    # tempdir, or a target that hasn't installed any kernel package yet),
+    # fall back to the legacy single-entry behaviour with distro defaults.
+    local -a basenames=()
+    local line base vmlinuz_rel initrd_rel
+    while IFS=$'\t' read -r base vmlinuz_rel initrd_rel; do
+        [[ -n "$base" ]] || continue
+        sdboot_write_entry "$loader_dir" "$base" "$vmlinuz_rel" "$initrd_rel" "$cmdline"
+        basenames+=("$base")
+    done < <(sdboot_enumerate_kernels "$root_mp")
+
+    if (( ${#basenames[@]} == 0 )); then
+        warn "No kernels found under $root_mp/boot — writing fallback single-entry."
+        local fb_linux fb_initrd
+        case "$DISTRO_LIKE" in
+            debian) fb_linux="/vmlinuz" ;     fb_initrd="/initrd.img" ;;
+            arch)   fb_linux="/vmlinuz-linux" ; fb_initrd="/initramfs-linux.img" ;;
+            *)      die "sdboot_install: unknown DISTRO_LIKE '$DISTRO_LIKE'" 10 ;;
+        esac
+        sdboot_write_entry "$loader_dir" "fallback" "$fb_linux" "$fb_initrd" "$cmdline"
+        basenames=("fallback")
+    fi
+
+    local default_base; default_base=$(_sdboot_pick_default "${basenames[@]}")
+    write_file "$loader_dir/loader.conf" "default  btrfs-migrate-$default_base.conf
 timeout  5
 console-mode max
-'
-
-    local entry="$loader_dir/entries/btrfs-migrate.conf"
-    local linux initrd arch
-    arch=$(uname -m)
-    case "$DISTRO_LIKE" in
-        debian) linux="/vmlinuz" ; initrd="/initrd.img" ;;   # Ubuntu maintains symlinks in /
-        arch)   linux="/vmlinuz-linux" ; initrd="/initramfs-linux.img" ;;
-        *)      die "sdboot_install: unknown DISTRO_LIKE '$DISTRO_LIKE'" 10 ;;
-    esac
-
-    write_file "$entry" "title   btrfs-migrate ($arch)
-linux   $linux
-initrd  $initrd
-options $cmdline rw
 "
+    log "systemd-boot default: btrfs-migrate-$default_base.conf (${#basenames[@]} entry(s) written)"
+
+    # Verify entries are recognized by bootctl. Skip in plan-only because
+    # the chroot tree isn't real.
+    if (( BTRFS_MIGRATE_PLAN_ONLY == 0 )); then
+        sdboot_verify_entries "$root_mp" "${#basenames[@]}"
+    fi
+}
+
+# sdboot_verify_entries ROOT_MP EXPECTED — run `bootctl list` inside the
+# chroot and require at least EXPECTED type-1 entries. Dies with code 41
+# if bootctl recognizes fewer than expected (entry parse failure, wrong
+# ESP path, etc).
+sdboot_verify_entries() {
+    local root_mp="$1" expected="$2"
+    local out
+    out=$(chroot "$root_mp" bootctl --esp-path=/boot/efi list 2>&1 || true)
+    local got
+    got=$(printf '%s\n' "$out" | grep -cE '^[[:space:]]*type:[[:space:]]' || true)
+    if (( got < expected )); then
+        error "bootctl list output:"
+        printf '%s\n' "$out" >&2
+        die "systemd-boot verify: bootctl recognized $got entry(s); expected $expected. Inspect $root_mp/boot/efi/loader/entries/." 41
+    fi
+    ok "systemd-boot verify: bootctl sees $got entry(s) (expected >=$expected)"
+}
+
+# -- Entry verification ------------------------------------------------------
+
+# bootloader_verify_entries ROOT_MP CHOICE — assert that the chosen loader
+# has at least one recognized entry. For GRUB we grep grub.cfg; for
+# systemd-boot we run `bootctl list` inside the chroot. Dies with code 41
+# on mismatch so the operator can inspect the loader state before reboot.
+bootloader_verify_entries() {
+    local root_mp="$1" choice="$2"
+    case "$choice" in
+        grub)
+            local cfg=""
+            if   [[ -f "$root_mp/boot/grub/grub.cfg"  ]]; then cfg="$root_mp/boot/grub/grub.cfg"
+            elif [[ -f "$root_mp/boot/grub2/grub.cfg" ]]; then cfg="$root_mp/boot/grub2/grub.cfg"
+            fi
+            [[ -n "$cfg" ]] || die "bootloader verify: no grub.cfg found under $root_mp/boot" 41
+            local count
+            count=$(grep -cE '^[[:space:]]*menuentry[[:space:]]' "$cfg" || true)
+            (( count > 0 )) || die "bootloader verify: grub.cfg has no menuentry lines ($cfg)" 41
+            ok "GRUB verify: $count menuentry line(s) in $(basename -- "$cfg")"
+            ;;
+        systemd-boot)
+            local out
+            out=$(chroot "$root_mp" bootctl --esp-path=/boot/efi list 2>&1 || true)
+            # `bootctl list` prints one block per entry; counting 'type:' lines
+            # gives the recognized entry count and works across bootctl versions.
+            local count
+            count=$(printf '%s\n' "$out" | grep -cE '^[[:space:]]*type:[[:space:]]' || true)
+            if (( count < 1 )); then
+                error "bootctl list output:"
+                printf '%s\n' "$out" >&2
+                die "bootloader verify: systemd-boot reports no entries — inspect $root_mp/boot/efi/loader/entries/" 41
+            fi
+            ok "systemd-boot verify: $count loader entry(s) recognized by bootctl"
+            ;;
+        *)
+            die "bootloader_verify_entries: unknown choice '$choice'" 41
+            ;;
+    esac
 }
 
 # -- Top-level dispatch ------------------------------------------------------

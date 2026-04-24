@@ -153,6 +153,10 @@ btrfs_populate_copy() {
 # each entry is owned by a uid matching a passwd entry. Corrects wrong
 # ownership by looking up the user in the target's /etc/passwd.
 # Directly addresses upstream issue #2.
+#
+# Before applying any chown, prints an announcement table so the operator
+# sees exactly which paths will change and from which uid/gid to which.
+# This makes post-migration UID drift auditable.
 btrfs_verify_home_ownership() {
     local target_mp="$1"
     local home_sv="$target_mp/@home"
@@ -163,7 +167,11 @@ btrfs_verify_home_ownership() {
     [[ -f "$passwd" ]] || passwd=/etc/passwd
     [[ -f "$passwd" ]] || { warn "No passwd file found to cross-check ownership."; return 0; }
 
-    local entry
+    # First pass: collect (path, cur, want, source) for every directory
+    # whose ownership doesn't match. We print the table first, then chown,
+    # so the operator sees the diff before the change.
+    local -a changes=()  # tab-separated: path \t cur \t want \t source
+    local d entry
     for d in "$home_sv"/*; do
         [[ -d "$d" ]] || continue
         local name; name=$(basename -- "$d")
@@ -176,11 +184,33 @@ btrfs_verify_home_ownership() {
         local cur_uid; cur_uid=$(stat -c '%u' "$d")
         local cur_gid; cur_gid=$(stat -c '%g' "$d")
         if [[ "$cur_uid" != "$want_uid" || "$cur_gid" != "$want_gid" ]]; then
-            log "Fixing ownership of $d ($cur_uid:$cur_gid -> $want_uid:$want_gid) [issue #2]"
-            run chown -R --no-dereference "$want_uid:$want_gid" "$d"
-        else
-            debug "Ownership OK for $d"
+            changes+=("$d"$'\t'"$cur_uid:$cur_gid"$'\t'"$want_uid:$want_gid"$'\t'"target /etc/passwd")
         fi
+    done
+
+    if (( ${#changes[@]} == 0 )); then
+        log "No /home ownership changes needed."
+        return 0
+    fi
+
+    printf '\n===== /home ownership changes =====\n' >&2
+    printf '  %-40s  %-10s  %-10s  %s\n' "PATH" "CURRENT" "DESIRED" "SOURCE" >&2
+    local row path cur want src
+    for row in "${changes[@]}"; do
+        path="${row%%$'\t'*}";    row="${row#*$'\t'}"
+        cur="${row%%$'\t'*}";     row="${row#*$'\t'}"
+        want="${row%%$'\t'*}";    src="${row#*$'\t'}"
+        printf '  %-40s  %-10s  %-10s  %s\n' "$path" "$cur" "$want" "$src" >&2
+    done
+    printf '\n' >&2
+
+    # Second pass: apply. Skipped under plan-only (run() handles that).
+    for row in "${changes[@]}"; do
+        path="${row%%$'\t'*}";    row="${row#*$'\t'}"
+        cur="${row%%$'\t'*}";     row="${row#*$'\t'}"
+        want="${row%%$'\t'*}"
+        log "Fixing ownership of $path ($cur -> $want) [issue #2]"
+        run chown -R --no-dereference "$want" "$path"
     done
 }
 
@@ -274,4 +304,55 @@ btrfs_home_strategy() {
     run umount "$new_mp"; rmdir "$new_mp" 2>/dev/null || true
     run rm -rf "$stage"
     ok "Separate /home converted to Btrfs with @home subvolume. Mount it via fstab."
+}
+
+# btrfs_postmigrate_check TARGET_MP [BOOT_DEV] — assert that the populated
+# @ subvolume contains the minimum files needed for a bootable system.
+# rsync exit code 0 is not sufficient proof of completeness — this catches
+# mid-flight terminations or silently-dropped directories.
+#
+# A kernel image is allowed to live either inside @/boot (when /boot is on
+# the same partition) or on the separate --boot partition; when BOOT_DEV is
+# passed we additionally probe the device's mounted kernels via findmnt.
+btrfs_postmigrate_check() {
+    local target_mp="$1" boot_dev="${2:-}"
+    local at="$target_mp/@"
+    [[ -d "$at" ]] || die "Post-rsync: $at missing." 40
+
+    local -a required=(
+        "$at/etc/passwd"
+        "$at/etc/shadow"
+        "$at/etc/fstab"
+    )
+    # shell can live in either /bin/sh or /usr/bin/sh depending on distro.
+    local shell_ok=0
+    [[ -e "$at/bin/sh" || -e "$at/usr/bin/sh" ]] && shell_ok=1
+
+    local -a missing=()
+    local f
+    for f in "${required[@]}"; do
+        [[ -e "$f" ]] || missing+=("$f")
+    done
+    (( shell_ok == 1 )) || missing+=("$at/bin/sh or $at/usr/bin/sh")
+
+    # Kernel image: check both @/boot/vmlinuz* and, if the separate boot
+    # device is mounted, its vmlinuz*.
+    local kernel_ok=0
+    if compgen -G "$at/boot/vmlinuz-*" >/dev/null 2>&1 || [[ -e "$at/boot/vmlinuz" ]]; then
+        kernel_ok=1
+    fi
+    if (( kernel_ok == 0 )) && [[ -n "$boot_dev" ]]; then
+        local boot_mp; boot_mp=$(findmnt -nro TARGET --source "$boot_dev" 2>/dev/null | head -n1 || true)
+        if [[ -n "$boot_mp" ]] && compgen -G "$boot_mp/vmlinuz-*" >/dev/null 2>&1; then
+            kernel_ok=1
+        fi
+    fi
+    (( kernel_ok == 1 )) || missing+=("kernel image under @/boot/vmlinuz-* or $boot_dev")
+
+    if (( ${#missing[@]} > 0 )); then
+        local m
+        for m in "${missing[@]}"; do error "Post-rsync: missing $m"; done
+        die "Post-rsync: target tree is incomplete — rsync reported success but critical files are absent. See missing paths above." 40
+    fi
+    ok "Post-rsync integrity check passed (${#required[@]} required + sh + kernel)."
 }
